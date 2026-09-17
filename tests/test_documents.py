@@ -16,7 +16,11 @@ from starlette.datastructures import Headers
 
 from app import main
 from app.core.database import Base, get_db
-from app.core.exceptions import DocumentProcessingError, UnsupportedFileTypeError
+from app.core.exceptions import (
+    DocumentNotFoundError,
+    DocumentProcessingError,
+    UnsupportedFileTypeError,
+)
 from app.models.document import Document
 from app.schemas.document import DocumentCreate, DocumentResponse, DocumentUpdate
 from app.services import document_service
@@ -181,7 +185,51 @@ def test_document_service_removes_file_when_database_write_fails(
     assert list(tmp_path.iterdir()) == []
 
 
-def test_upload_endpoint_persists_and_returns_document(
+def test_document_service_lists_documents_with_pagination(tmp_path: Path) -> None:
+    test_engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(test_engine)
+
+    with Session(test_engine) as session:
+        service = DocumentService(session, tmp_path)
+        documents = [
+            service.upload_pdf(_upload_file(filename=f"report-{index}.pdf"))
+            for index in range(3)
+        ]
+
+        page, total = service.list_documents(skip=1, limit=1)
+
+        assert total == 3
+        assert [document.id for document in page] == [documents[1].id]
+
+    test_engine.dispose()
+
+
+def test_document_service_gets_and_deletes_document_and_file(tmp_path: Path) -> None:
+    test_engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(test_engine)
+
+    with Session(test_engine) as session:
+        service = DocumentService(session, tmp_path)
+        document = service.upload_pdf(_upload_file())
+        document_id = document.id
+        uploaded_path = Path(document.file_path)
+
+        assert service.get_document(document_id).id == document_id
+        assert uploaded_path.is_file()
+
+        service.delete_document(document_id)
+
+        assert session.get(Document, document_id) is None
+        assert not uploaded_path.exists()
+        with pytest.raises(DocumentNotFoundError):
+            service.get_document(document_id)
+        with pytest.raises(DocumentNotFoundError):
+            service.delete_document(document_id)
+
+    test_engine.dispose()
+
+
+def test_document_management_api_flow(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -202,20 +250,41 @@ def test_upload_endpoint_persists_and_returns_document(
 
     try:
         with TestClient(main.app) as client:
-            response = client.post(
+            upload_response = client.post(
                 "/documents/upload",
                 files={"file": ("report.pdf", PDF_BYTES, "application/pdf")},
             )
+            assert upload_response.status_code == 201
+            payload = upload_response.json()
+            document_id = payload["id"]
+            uploaded_path = tmp_path / payload["filename"]
 
-        assert response.status_code == 201
-        payload = response.json()
+            get_response = client.get(f"/documents/{document_id}")
+            list_response = client.get("/documents", params={"skip": 0, "limit": 1})
+            delete_response = client.delete(f"/documents/{document_id}")
+            missing_get = client.get(f"/documents/{document_id}")
+            missing_delete = client.delete(f"/documents/{document_id}")
+
         assert payload["original_filename"] == "report.pdf"
         assert payload["status"] == "uploaded"
         assert payload["file_size"] == len(PDF_BYTES)
-        assert (tmp_path / payload["filename"]).is_file()
+        assert get_response.status_code == 200
+        assert get_response.json()["id"] == document_id
+        assert list_response.status_code == 200
+        assert list_response.json()["total"] == 1
+        assert list_response.json()["items"] == [payload]
+        assert list_response.json()["skip"] == 0
+        assert list_response.json()["limit"] == 1
+        assert delete_response.status_code == 204
+        assert delete_response.content == b""
+        assert not uploaded_path.exists()
+        assert missing_get.status_code == 404
+        assert missing_get.json()["error"]["code"] == "document_not_found"
+        assert missing_delete.status_code == 404
+        assert missing_delete.json()["error"]["code"] == "document_not_found"
 
         with testing_session() as session:
-            assert session.query(Document).count() == 1
+            assert session.query(Document).count() == 0
     finally:
         main.app.dependency_overrides.clear()
         test_engine.dispose()

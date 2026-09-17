@@ -49,3 +49,12 @@ class DocumentResponse(DocumentBase):
     status: str
     created_at: datetime
     updated_at: datetime
+
+
+class DocumentListResponse(BaseModel):
+    """Paginated collection of document metadata."""
+
+    items: list[DocumentResponse]
+    total: int = Field(ge=0)
+    skip: int = Field(ge=0)
+    limit: int = Field(ge=1)

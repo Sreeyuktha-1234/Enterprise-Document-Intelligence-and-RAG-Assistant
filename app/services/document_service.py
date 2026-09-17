@@ -4,11 +4,16 @@ from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
 from fastapi import UploadFile
+from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.exceptions import DocumentProcessingError, UnsupportedFileTypeError
+from app.core.exceptions import (
+    DocumentNotFoundError,
+    DocumentProcessingError,
+    UnsupportedFileTypeError,
+)
 from app.core.logging import get_logger
 from app.models.document import Document
 
@@ -77,6 +82,63 @@ class DocumentService:
         logger.info("Stored PDF document %s as %s", original_filename, stored_filename)
         return document
 
+    def list_documents(self, skip: int, limit: int) -> tuple[list[Document], int]:
+        """Return one page of documents and the total record count."""
+
+        total = self.db.scalar(select(func.count()).select_from(Document)) or 0
+        statement = (
+            select(Document)
+            .order_by(Document.created_at.desc(), Document.id.desc())
+            .offset(skip)
+            .limit(limit)
+        )
+        documents = list(self.db.scalars(statement).all())
+        return documents, total
+
+    def get_document(self, document_id: int) -> Document:
+        """Return a document or raise the shared not-found error."""
+
+        document = self.db.get(Document, document_id)
+        if document is None:
+            raise DocumentNotFoundError(
+                f"Document with ID {document_id} was not found."
+            )
+        return document
+
+    def delete_document(self, document_id: int) -> None:
+        """Delete document metadata and its managed uploaded file."""
+
+        document = self.get_document(document_id)
+        file_path = self._resolve_managed_path(document.file_path)
+        staged_path: Path | None = None
+
+        if file_path.exists():
+            staged_path = file_path.with_name(
+                f".{file_path.name}.{uuid4().hex}.deleting"
+            )
+            try:
+                file_path.replace(staged_path)
+            except OSError as exc:
+                raise DocumentProcessingError(
+                    "The document file could not be prepared for deletion."
+                ) from exc
+
+        try:
+            self.db.delete(document)
+            self.db.commit()
+        except SQLAlchemyError as exc:
+            self.db.rollback()
+            if staged_path is not None:
+                self._restore_staged_file(staged_path, file_path)
+            logger.exception("Failed to delete document metadata for ID %s", document_id)
+            raise DocumentProcessingError(
+                "The document metadata could not be deleted."
+            ) from exc
+
+        if staged_path is not None:
+            self._remove_file(staged_path)
+        logger.info("Deleted document ID %s", document_id)
+
     @staticmethod
     def _validate_pdf(upload: UploadFile) -> str:
         raw_filename = upload.filename or ""
@@ -113,6 +175,34 @@ class DocumentService:
                 output.write(chunk)
                 file_size += len(chunk)
         return file_size
+
+    def _resolve_managed_path(self, stored_path: str) -> Path:
+        upload_root = self.upload_directory.resolve()
+        candidate = Path(stored_path)
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        resolved_path = candidate.resolve()
+
+        if not resolved_path.is_relative_to(upload_root):
+            logger.error(
+                "Refusing to delete document path outside upload directory: %s",
+                resolved_path,
+            )
+            raise DocumentProcessingError(
+                "The stored document path is outside the upload directory."
+            )
+        return resolved_path
+
+    @staticmethod
+    def _restore_staged_file(staged_path: Path, original_path: Path) -> None:
+        try:
+            staged_path.replace(original_path)
+        except OSError:
+            logger.error(
+                "Could not restore document file %s after database rollback",
+                original_path,
+                exc_info=True,
+            )
 
     @staticmethod
     def _remove_file(path: Path) -> None:
