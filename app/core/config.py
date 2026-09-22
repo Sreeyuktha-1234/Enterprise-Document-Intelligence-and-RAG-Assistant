@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "llama3.2"
     EMBEDDING_MODEL: str = "nomic-embed-text"
+    CHUNK_SIZE: int = Field(default=1000, gt=0)
+    CHUNK_OVERLAP: int = Field(default=200, ge=0)
     VECTOR_STORE_PATH: Path = Path("data/vector_store")
     UPLOAD_DIRECTORY: Path = Path("data/uploads")
 
