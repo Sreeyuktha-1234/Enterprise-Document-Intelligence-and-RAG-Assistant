@@ -105,6 +105,26 @@ class DocumentService:
             )
         return document
 
+    def update_status(self, document: Document, status: str) -> Document:
+        """Persist a document processing status change."""
+
+        document.status = status
+        try:
+            self.db.add(document)
+            self.db.commit()
+            self.db.refresh(document)
+        except SQLAlchemyError as exc:
+            self.db.rollback()
+            logger.exception(
+                "Failed to update document ID %s to status %s",
+                document.id,
+                status,
+            )
+            raise DocumentProcessingError(
+                "The document processing status could not be updated."
+            ) from exc
+        return document
+
     def delete_document(self, document_id: int) -> None:
         """Delete document metadata and its managed uploaded file."""
 

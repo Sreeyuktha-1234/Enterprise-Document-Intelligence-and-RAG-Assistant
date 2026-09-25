@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import shutil
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -123,6 +124,73 @@ class VectorStoreService:
         logger.info("Added %s documents to the FAISS index", len(documents))
         return document_ids
 
+    def replace_document(
+        self,
+        document_id: int,
+        documents: Sequence[LangChainDocument],
+    ) -> list[str]:
+        """Replace all indexed chunks for one source document and persist them."""
+
+        self._validate_documents(documents)
+        if any(
+            str(document.metadata.get("document_id")) != str(document_id)
+            for document in documents
+        ):
+            raise ValueError(
+                "Every replacement chunk must belong to the requested document."
+            )
+
+        document_ids = [uuid4().hex for _ in documents]
+        vectors = self.embedding_service.embed_documents(documents)
+        text_embeddings = list(
+            zip(
+                (document.page_content for document in documents),
+                vectors,
+                strict=True,
+            )
+        )
+
+        had_persisted_index = self._persisted_artifacts_exist()
+        try:
+            if self.vector_store is None and had_persisted_index:
+                self.load_vector_store()
+
+            if self.vector_store is None:
+                self.vector_store = FAISS.from_embeddings(
+                    text_embeddings,
+                    self.embedding_service.backend,
+                    metadatas=[dict(document.metadata) for document in documents],
+                    ids=document_ids,
+                )
+            else:
+                stale_ids = self._document_store_ids(document_id)
+                if stale_ids:
+                    self.vector_store.delete(stale_ids)
+                self.vector_store.add_embeddings(
+                    text_embeddings,
+                    metadatas=[dict(document.metadata) for document in documents],
+                    ids=document_ids,
+                )
+
+            self.save_vector_store()
+        except Exception:
+            self.vector_store = None
+            if had_persisted_index:
+                try:
+                    self.load_vector_store()
+                except Exception:
+                    logger.exception(
+                        "Failed to restore the previous FAISS index in memory"
+                    )
+            raise
+
+        logger.info(
+            "Replaced FAISS chunks for document ID %s with %s chunks",
+            document_id,
+            len(documents),
+        )
+        return document_ids
+
     def save_vector_store(self) -> None:
         """Persist the active index and write its integrity manifest last."""
 
@@ -131,13 +199,67 @@ class VectorStoreService:
         if self.vector_store_path.is_symlink():
             raise ValueError("The vector-store directory cannot be a symbolic link.")
 
-        self.vector_store_path.mkdir(parents=True, exist_ok=True)
-        self.vector_store.save_local(
-            str(self.vector_store_path),
-            index_name=INDEX_NAME,
-        )
-        self._write_manifest()
+        parent = self.vector_store_path.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        staging_path = parent / f".{self.vector_store_path.name}.{uuid4().hex}.tmp"
+        backup_path = parent / f".{self.vector_store_path.name}.{uuid4().hex}.bak"
+
+        try:
+            staging_path.mkdir()
+            self.vector_store.save_local(str(staging_path), index_name=INDEX_NAME)
+            self._write_manifest(staging_path)
+            self._install_staged_artifacts(staging_path, backup_path)
+        finally:
+            shutil.rmtree(staging_path, ignore_errors=True)
+            shutil.rmtree(backup_path, ignore_errors=True)
         logger.info("Persisted FAISS index to %s", self.vector_store_path)
+
+    def _document_store_ids(self, document_id: int) -> list[str]:
+        if self.vector_store is None:
+            return []
+
+        matching_ids: list[str] = []
+        for store_id in self.vector_store.index_to_docstore_id.values():
+            document = self.vector_store.docstore.search(store_id)
+            if (
+                isinstance(document, LangChainDocument)
+                and str(document.metadata.get("document_id")) == str(document_id)
+            ):
+                matching_ids.append(store_id)
+        return matching_ids
+
+    def _install_staged_artifacts(
+        self,
+        staging_path: Path,
+        backup_path: Path,
+    ) -> None:
+        """Install a complete staged index and restore the old one on failure."""
+
+        filenames = (INDEX_FILENAME, DOCSTORE_FILENAME, MANIFEST_FILENAME)
+        self.vector_store_path.mkdir(parents=True, exist_ok=True)
+        backup_path.mkdir()
+        backed_up: list[str] = []
+        installed: list[str] = []
+
+        try:
+            for filename in filenames:
+                destination = self.vector_store_path / filename
+                if destination.exists():
+                    destination.replace(backup_path / filename)
+                    backed_up.append(filename)
+            for filename in filenames:
+                (staging_path / filename).replace(
+                    self.vector_store_path / filename
+                )
+                installed.append(filename)
+        except Exception:
+            for filename in installed:
+                (self.vector_store_path / filename).unlink(missing_ok=True)
+            for filename in backed_up:
+                (backup_path / filename).replace(
+                    self.vector_store_path / filename
+                )
+            raise
 
     def _create_store(
         self,
@@ -207,8 +329,8 @@ class VectorStoreService:
         except (KeyError, TypeError, json.JSONDecodeError) as exc:
             raise ValueError("The FAISS integrity manifest is invalid.") from exc
 
-    def _write_manifest(self) -> None:
-        artifacts = self._artifact_paths()
+    def _write_manifest(self, directory: Path | None = None) -> None:
+        artifacts = self._artifact_paths(directory)
         manifest = {
             "version": MANIFEST_VERSION,
             "embedding_model": self.embedding_service.model_name,
@@ -225,11 +347,12 @@ class VectorStoreService:
         )
         temporary_path.replace(manifest_path)
 
-    def _artifact_paths(self) -> dict[str, Path]:
+    def _artifact_paths(self, directory: Path | None = None) -> dict[str, Path]:
+        root = directory or self.vector_store_path
         return {
-            INDEX_FILENAME: self.vector_store_path / INDEX_FILENAME,
-            DOCSTORE_FILENAME: self.vector_store_path / DOCSTORE_FILENAME,
-            MANIFEST_FILENAME: self.vector_store_path / MANIFEST_FILENAME,
+            INDEX_FILENAME: root / INDEX_FILENAME,
+            DOCSTORE_FILENAME: root / DOCSTORE_FILENAME,
+            MANIFEST_FILENAME: root / MANIFEST_FILENAME,
         }
 
     @staticmethod

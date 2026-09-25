@@ -152,3 +152,48 @@ def test_create_rejects_empty_or_blank_documents(tmp_path: Path) -> None:
         service.create_vector_store([])
     with pytest.raises(ValueError, match="non-whitespace"):
         service.create_vector_store([LangChainDocument(page_content="   ")])
+
+
+def test_replace_document_is_idempotent_and_preserves_other_sources(
+    tmp_path: Path,
+) -> None:
+    service = VectorStoreService(_embedding_service(), tmp_path)
+    service.create_vector_store(_documents())
+    replacement = LangChainDocument(
+        page_content="Updated enterprise risk controls.",
+        metadata={
+            "document_id": 1,
+            "filename": "risk.pdf",
+            "page_number": 2,
+            "chunk_index": 0,
+            "source": "data/uploads/risk.pdf",
+        },
+    )
+
+    service.replace_document(1, [replacement])
+    service.replace_document(1, [replacement])
+    reloaded = VectorStoreService(_embedding_service(), tmp_path).load_vector_store()
+
+    assert reloaded.index.ntotal == 2
+    stored_documents = list(reloaded.docstore._dict.values())
+    assert sum(document.metadata["document_id"] == 1 for document in stored_documents) == 1
+    assert any(document.metadata["document_id"] == 2 for document in stored_documents)
+
+
+def test_failed_replacement_keeps_previous_persisted_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = VectorStoreService(_embedding_service(), tmp_path)
+    service.create_vector_store(_documents())
+
+    def fail_install(*args: object) -> None:
+        raise OSError("simulated persistence failure")
+
+    monkeypatch.setattr(service, "_install_staged_artifacts", fail_install)
+
+    with pytest.raises(OSError, match="simulated persistence failure"):
+        service.replace_document(1, [_documents()[0]])
+
+    reloaded = VectorStoreService(_embedding_service(), tmp_path).load_vector_store()
+    assert reloaded.index.ntotal == 2
