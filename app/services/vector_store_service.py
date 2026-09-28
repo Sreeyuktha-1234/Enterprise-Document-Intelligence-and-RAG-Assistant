@@ -84,6 +84,13 @@ class VectorStoreService:
         logger.info("Loaded FAISS index from %s", self.vector_store_path)
         return self.vector_store
 
+    def load_vector_store_if_exists(self) -> FAISS | None:
+        """Load the index, or return ``None`` when no index artifacts exist."""
+
+        if not self._persisted_artifacts_exist():
+            return None
+        return self.load_vector_store()
+
     def add_documents(
         self,
         documents: Sequence[LangChainDocument],

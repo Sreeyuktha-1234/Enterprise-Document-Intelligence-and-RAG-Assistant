@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
     CHUNK_SIZE: int = Field(default=1000, gt=0)
     CHUNK_OVERLAP: int = Field(default=200, ge=0)
+    RETRIEVAL_TOP_K: int = Field(default=5, gt=0)
     VECTOR_STORE_PATH: Path = Path("data/vector_store")
     UPLOAD_DIRECTORY: Path = Path("data/uploads")
 
