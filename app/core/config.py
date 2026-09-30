@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     DATABASE_URL: str = "sqlite:///./data/app.db"
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "llama3.2"
+    OLLAMA_TEMPERATURE: float = Field(default=0.1, ge=0.0, le=2.0)
+    OLLAMA_MAX_TOKENS: int = Field(default=1024, gt=0)
+    OLLAMA_REQUEST_TIMEOUT: float = Field(default=120.0, gt=0.0)
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
     CHUNK_SIZE: int = Field(default=1000, gt=0)
     CHUNK_OVERLAP: int = Field(default=200, ge=0)
