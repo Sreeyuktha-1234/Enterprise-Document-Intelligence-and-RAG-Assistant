@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     CHUNK_SIZE: int = Field(default=1000, gt=0)
     CHUNK_OVERLAP: int = Field(default=200, ge=0)
     RETRIEVAL_TOP_K: int = Field(default=5, gt=0)
+    RAG_MIN_RELEVANCE_SCORE: float = Field(default=0.0, ge=0.0, le=1.0)
     VECTOR_STORE_PATH: Path = Path("data/vector_store")
     UPLOAD_DIRECTORY: Path = Path("data/uploads")
 
